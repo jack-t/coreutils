@@ -300,6 +300,23 @@ impl Output {
     }
 }
 
+fn total_physical_memory() -> u64 {
+    use std::mem::MaybeUninit;
+    use uucore::libc::sysinfo;
+
+    let mut info: MaybeUninit<sysinfo> = MaybeUninit::uninit();
+
+    unsafe {
+        let result = sysinfo(info.as_mut_ptr());
+        if result != 0 {
+            panic!("System info call failed. Cannot find size of physical memory.")
+        }
+    }
+
+    let info = unsafe { info.assume_init() };
+    info.totalram * (info.mem_unit as u64)
+}
+
 #[derive(Clone)]
 pub struct GlobalSettings {
     mode: SortMode,
@@ -343,28 +360,36 @@ impl GlobalSettings {
     fn parse_byte_count(input: &str) -> Result<usize, ParseSizeError> {
         // GNU sort (8.32)   valid: 1b,        k, K, m, M, g, G, t, T, P, E, Z, Y
         // GNU sort (8.32) invalid:  b, B, 1B,                         p, e, z, y
-        const ALLOW_LIST: &[char] = &[
-            'b', 'k', 'K', 'm', 'M', 'g', 'G', 't', 'T', 'P', 'E', 'Z', 'Y',
-        ];
+        const ALLOW_LIST: &[char] = &['k', 'K', 'm', 'M', 'g', 'G', 't', 'T', 'P', 'E', 'Z', 'Y'];
         let mut size_string = input.trim().to_string();
 
-        if size_string.ends_with(|c: char| ALLOW_LIST.contains(&c) || c.is_digit(10)) {
-            // b 1, K 1024 (default)
-            if size_string.ends_with(|c: char| c.is_digit(10)) {
-                size_string.push('K');
-            } else if size_string.ends_with('b') {
-                size_string.pop();
-            }
-            let size = parse_size(&size_string)?;
-            usize::try_from(size).map_err(|_| {
-                ParseSizeError::SizeTooBig(format!(
-                    "Buffer size {} does not fit in address space",
-                    size
-                ))
-            })
+        let size = if size_string.ends_with(|c: char| c.is_digit(10)) {
+            size_string.push('K');
+            parse_size(&size_string)
+        } else if size_string.ends_with(|c: char| ALLOW_LIST.contains(&c)) {
+            parse_size(&size_string)
+        } else if size_string.ends_with('b') {
+            // parse_size treats b as 512, but `sort` doesn't want that behavior
+            size_string.pop();
+            parse_size(&size_string)
+        } else if size_string.ends_with('%') {
+            // percentage parsing is rare in coreutils -- no need to move this to uucore
+            size_string[0..size_string.len() - 1]
+                .parse()
+                .and_then(|pct: u64| Ok(pct * total_physical_memory() / 100))
+                .map_err(|_| ParseSizeError::ParseFailure(size_string))
         } else {
             Err(ParseSizeError::ParseFailure("invalid suffix".to_string()))
-        }
+        };
+
+        size.and_then(|s| {
+            usize::try_from(s).map_err(|_| {
+                ParseSizeError::SizeTooBig(format!(
+                    "Buffer size {} does not fit in address space",
+                    s
+                ))
+            })
+        })
     }
 
     /// Precompute some data needed for sorting.
@@ -1926,6 +1951,20 @@ mod tests {
         // We should make sure to not regress the size of the Line struct because
         // it is unconditional overhead for every line we sort.
         assert_eq!(std::mem::size_of::<Line>(), 24);
+    }
+
+    #[test]
+    fn test_parses_memory_percentages() {
+        let physical_memory = total_physical_memory();
+        assert_eq!(
+            GlobalSettings::parse_byte_count("100%").unwrap(),
+            physical_memory as usize
+        );
+        assert_eq!(
+            GlobalSettings::parse_byte_count("50%").unwrap(),
+            (physical_memory / 2) as usize
+        );
+        assert_eq!(GlobalSettings::parse_byte_count("0%").unwrap(), 0 as usize);
     }
 
     #[test]
